@@ -12,7 +12,8 @@
       var bar = TZ.readerBar(r.value, {
         displayName: item.from && item.from.displayName,
         refMs: item.dateTimeCreated ? item.dateTimeCreated.getTime() : Date.now(),
-        deviceTz: Intl.DateTimeFormat().resolvedOptions().timeZone
+        deviceTz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        others: null // coworker zones arrive in version 0.2 (Graph getSchedule)
       });
       if (bar) {
         item.notificationMessages.replaceAsync(KEY, {
