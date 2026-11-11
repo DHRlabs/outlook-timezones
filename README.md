@@ -1,14 +1,18 @@
 # Outlook Time Zones
 
-A small Outlook add-in (Office.js, version 0.1.1). Plain static files, no build step.
+A small Outlook add-in (Office.js, version 0.1.2). Plain static files, no build step.
 
-- Reading: when a message has a clock time with a zone, one thin bar above the body shows it in your zone, like `4pm EST M.Santos | 2pm AZ you`.
+- Reading: when a message has a clock time with a zone, a thin bar above the body shows your time first, then where it came from, like `1-2 PM AZ  <-  4-5 PM EST  A.Saxena`.
+- One bar per time, up to four. A fifth and later time is counted at the end of the fourth bar as `+2 more`.
+- A weekday leads the bar when the sender wrote one: `THU 2 PM AZ  <-  4 PM EST  M.Santos`.
 - Names in the bar are first initial and last name: Maria Santos shows as `M.Santos`. A one-word name stays whole.
 - Writing: the "Add time zones" button rewrites each clock time in your draft as `2pm AZ [3pm CT / 4pm ET]`. Clicking twice changes nothing.
+- The same rewrite also runs by itself when you send a message, so you do not have to remember the button. The add-in never blocks a send on its own errors: if the rewrite fails, the message goes as written. If Outlook cannot load the add-in at all, or the add-in takes longer than five seconds, Outlook shows its own dialog with a Send Anyway choice.
 - Your zone is your device zone. Times with no zone written are never guessed.
+- The rewrite only adds the label: every other byte of the message is left exactly as Outlook wrote it, so Word's own markup, the quoted thread, and your signature come out unchanged. If anything about the message cannot be read with certainty, nothing is written.
 - When the writer already gave the same time in two zones (`4pm ET / 1pm PT`), the bar shows it once and the draft is left alone. Two different times (`2pm ET / 3pm CT`) are both read and both converted.
 - Hosted on GitHub Pages at https://dhrlabs.github.io/outlook-timezones/.
-- Needs Outlook on the web, new Outlook, or Outlook for Mac (mailbox requirement set 1.5).
+- The buttons, the pinned pane, and the automatic rewrite at Send need Outlook on the web, new Outlook, or Outlook for Mac, at mailbox requirement set 1.12 or later. Classic Outlook for Windows gets no automatic rewrite at Send.
 
 ## Time forms it reads
 

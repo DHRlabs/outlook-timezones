@@ -3,9 +3,26 @@
 <head>
   <meta charset="utf-8">
   <title>Time Zones</title>
+  <!-- The pane follows the Office theme. Office.context.officeTheme is set below when the host
+       gives it; until then system colors keep the text readable in dark and light mode. -->
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; padding: 12px;
+      font: 14px -apple-system, "Segoe UI", system-ui, sans-serif;
+      background: Canvas; color: CanvasText;
+    }
+  </style>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="timezones.js"></script>
   <script src="read.js"></script>
+  <script>
+    Office.onReady(function () {
+      var t = Office.context && Office.context.officeTheme;
+      if (t && t.bodyBackgroundColor) document.body.style.background = t.bodyBackgroundColor;
+      if (t && t.bodyForegroundColor) document.body.style.color = t.bodyForegroundColor;
+    });
+  </script>
 </head>
 <body>
   <p>Time Zones</p>

@@ -1,6 +1,6 @@
-/* Read side: keeps one informational bar above the open message. Runs in the pinned task pane. */
+/* Read side: keeps one informational bar per time above the open message. Runs in the pinned pane. */
 (function () {
-  var KEY = "otz-bar";
+  var KEYS = TZ.BAR_KEYS;
 
   function update() {
     var item = Office.context.mailbox.item;
@@ -9,22 +9,26 @@
     item.body.getAsync(Office.CoercionType.Text, function (r) {
       if (r.status !== Office.AsyncResultStatus.Succeeded) return;
       if (Office.context.mailbox.item !== item) return; // user moved on
-      var bar = TZ.readerBar(r.value, {
+      var bars = TZ.readerBar(r.value, {
         displayName: item.from && item.from.displayName,
         refMs: item.dateTimeCreated ? item.dateTimeCreated.getTime() : Date.now(),
         deviceTz: Intl.DateTimeFormat().resolvedOptions().timeZone,
         others: null // coworker zones arrive in version 0.2 (Graph getSchedule)
+      }) || [];
+      KEYS.forEach(function (key, i) {
+        if (i < bars.length) {
+          item.notificationMessages.replaceAsync(key, {
+            type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
+            message: bars[i],
+            icon: "icon-16",
+            persistent: false
+          }, function () {});
+        } else {
+          // Every key this message is not using is cleared, so no bar from the last message stays.
+          // Removing a key that was never set is fine: the failed result is read and dropped.
+          item.notificationMessages.removeAsync(key, function () {});
+        }
       });
-      if (bar) {
-        item.notificationMessages.replaceAsync(KEY, {
-          type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
-          message: bar,
-          icon: "icon-16",
-          persistent: false
-        });
-      } else {
-        item.notificationMessages.removeAsync(KEY, function () {}); // no bar yet is fine
-      }
     });
   }
 

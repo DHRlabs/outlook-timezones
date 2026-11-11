@@ -6,7 +6,7 @@
   xmlns:mailappor="http://schemas.microsoft.com/office/mailappversionoverrides/1.0"
   xsi:type="MailApp">
   <Id>aeaf27de-4d1e-40ad-af3a-f4a75ef57ef8</Id>
-  <Version>1.0.0.0</Version>
+  <Version>1.0.2.0</Version>
   <ProviderName>DHRlabs</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Time Zones"/>
@@ -38,13 +38,26 @@
   <DisableEntityHighlighting>true</DisableEntityHighlighting>
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides" xsi:type="VersionOverridesV1_0">
     <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides/1.1" xsi:type="VersionOverridesV1_1">
+      <!-- OnMessageSend arrived in mailbox requirement set 1.12, so the ribbon and the launch
+           event need 1.12. The base Requirements above stay at 1.5, so the add-in still installs
+           on a 1.5 client and the read pane still opens there through FormSettings; only the
+           ribbon buttons and the send event need the newer client. -->
       <Requirements>
-        <bt:Sets DefaultMinVersion="1.5">
+        <bt:Sets DefaultMinVersion="1.12">
           <bt:Set Name="Mailbox"/>
         </bt:Sets>
       </Requirements>
       <Hosts>
         <Host xsi:type="MailHost">
+          <!-- Event-based activation runs in a lightweight runtime (Smart Alerts walkthrough,
+               add-in only manifest: "Event-based activation happens in a lightweight runtime").
+               The Runtime resid is the HTML page Outlook on the web, on Mac, and new Outlook on
+               Windows load; the javascript Override is the file classic Outlook on Windows loads. -->
+          <Runtimes>
+            <Runtime resid="commandsUrl">
+              <Override type="javascript" resid="jsRuntimeUrl"/>
+            </Runtime>
+          </Runtimes>
           <DesktopFormFactor>
             <FunctionFile resid="commandsUrl"/>
             <ExtensionPoint xsi:type="MessageReadCommandSurface">
@@ -73,7 +86,7 @@
             <ExtensionPoint xsi:type="MessageComposeCommandSurface">
               <OfficeTab id="TabDefault">
                 <Group id="composeGroup">
-                  <Label resid="groupLabel"/>
+                  <Label resid="addLabel"/>
                   <Control xsi:type="Button" id="addZonesButton">
                     <Label resid="addLabel"/>
                     <Supertip>
@@ -92,6 +105,15 @@
                 </Group>
               </OfficeTab>
             </ExtensionPoint>
+            <!-- Add time zones automatically when the message is sent. SendMode "PromptUser" means
+                 that if the add-in is unavailable or errors, "the item will be sent": a failure here
+                 never blocks a send. SourceLocation names the browser runtime above. -->
+            <ExtensionPoint xsi:type="LaunchEvent">
+              <LaunchEvents>
+                <LaunchEvent Type="OnMessageSend" FunctionName="onMessageSendHandler" SendMode="PromptUser"/>
+              </LaunchEvents>
+              <SourceLocation resid="commandsUrl"/>
+            </ExtensionPoint>
           </DesktopFormFactor>
         </Host>
       </Hosts>
@@ -105,6 +127,8 @@
         <bt:Urls>
           <bt:Url id="readUrl" DefaultValue="https://dhrlabs.github.io/outlook-timezones/src/read.html"/>
           <bt:Url id="commandsUrl" DefaultValue="https://dhrlabs.github.io/outlook-timezones/src/commands.html"/>
+          <!-- Entry needed for classic Outlook on Windows. -->
+          <bt:Url id="jsRuntimeUrl" DefaultValue="https://dhrlabs.github.io/outlook-timezones/src/commands.js"/>
         </bt:Urls>
         <bt:ShortStrings>
           <bt:String id="groupLabel" DefaultValue="Time Zones"/>

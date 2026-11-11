@@ -47,6 +47,11 @@
 
   var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   var MAX_BAR = 150; // NotificationMessageDetails.message maximum length
+  // Outlook allows at most 5 informational notifications on one message, so the add-in sets 4.
+  var MAX_BARS = 4;
+  // The notification keys this add-in owns, in bar order. Keys are at most 32 characters.
+  // The first key is the one 0.1 used, so an old bar is replaced rather than left beside a new one.
+  var BAR_KEYS = ["otz-bar", "otz-bar-2", "otz-bar-3", "otz-bar-4"];
 
   // ---- Intl offset math ----
   // A zone string taken from email text (an offset like "-05:00") or from a caller's people list
@@ -96,6 +101,38 @@
     return hh + (mi ? ":" + (mi < 10 ? "0" : "") + mi : "") + suffix;
   }
 
+  // ---- Bar formatting (read side only; compose keeps fmt above) ----
+  // "2 PM", "2:30 PM": capitals, one space before the meridiem.
+  function clock(h, mi) {
+    var hh = h % 12 === 0 ? 12 : h % 12;
+    return hh + (mi ? ":" + (mi < 10 ? "0" : "") + mi : "");
+  }
+  function fmtCap(h, mi) { return clock(h, mi) + " " + (h >= 12 ? "PM" : "AM"); }
+  // A range whose end clock reads earlier than its start crosses midnight ("11:30 PM-1:30 AM").
+  function rollsOver(h1, mi1, h2, mi2) {
+    if (h2 === null || h2 === undefined) return false;
+    return h2 * 60 + mi2 < h1 * 60 + mi1;
+  }
+  // A range writes the meridiem once when both ends share it: "1-2 PM", "11:30 AM-1 PM".
+  function rangeCap(h1, mi1, h2, mi2) {
+    if (h2 === null || h2 === undefined) return fmtCap(h1, mi1);
+    if ((h1 >= 12) === (h2 >= 12)) return clock(h1, mi1) + "-" + fmtCap(h2, mi2);
+    return fmtCap(h1, mi1) + "-" + fmtCap(h2, mi2);
+  }
+  // The sender's own time, normalized the same way. "noon"/"midnight" stay as written, capitalized.
+  function senderCap(m) {
+    return m.word ? m.word.toUpperCase() : rangeCap(m.h1, m.mi1, m.h2, m.mi2);
+  }
+  // The sender's zone word as they wrote it: abbreviations upper-cased, spelled-out names
+  // capitalized so a lowercase "eastern" reads as "Eastern" on the bar.
+  function senderZone(m) {
+    var raw = m.zoneRaw || m.zoneTok || "";
+    if (raw.length <= 4) return raw.toUpperCase();
+    return raw.replace(/[A-Za-z\u00c0-\u024f]+/g, function (w) {
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    });
+  }
+
   function labelFor(tz, ms) {
     if (LABELS[tz]) return LABELS[tz];
     var p = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" })
@@ -142,6 +179,8 @@
   function zoneAfter(after) {
     var m = ZONE_AFTER.exec(after), world = m && m[2] && WORLD_NAMES[m[3].toUpperCase()];
     var tok = world ? world[0] : m && m[4].toUpperCase(), z = world ? world[1] : m && zoneWord(m[4]), len;
+    // The zone word exactly as the sender wrote it, for the read bar.
+    var raw = world ? world[0] : m && m[4];
     if (z === SKIP) return SKIP;
     if (z) {
       len = m[0].length;
@@ -154,14 +193,14 @@
         // A sign that is not a readable offset ("UTC++5", "UTC+-5") is still an offset the writer
         // meant: the time is skipped whole rather than read as plain UTC.
         if (!off && /^[ \u00a0]?[+\-\u2212]/.test(after.slice(len))) return SKIP;
-        if (reg) { z = reg; tok = tok + off[0].replace(/[ \u00a0]/g, ""); len += off[0].length; }
+        if (reg) { z = reg; tok = tok + off[0].replace(/[ \u00a0]/g, ""); raw = tok; len += off[0].length; }
       }
       if (z && m[1]) {
         if (after[len] !== (m[1] === "(" ? ")" : "]")) z = null;
         else len++;
       }
       if (z && /^[+\-\u2212]\d/.test(after.slice(len))) return SKIP; // offset label like GMT+2
-      if (z) return { len: len, tok: tok, region: z };
+      if (z) return { len: len, tok: tok, raw: raw, region: z };
     }
     // Not cleanly parsed, but a zone word starts right after the time: skip it whole.
     var n = NEAR_TOKEN.exec(after);
@@ -305,9 +344,10 @@
         r.h1 = mhv; r.mi1 = mmv;
       } else {
         r.h1 = g.nm.toLowerCase() === "noon" ? 12 : 0; r.mi1 = 0;
+        r.word = g.nm; // "noon"/"midnight": shown as written, capitalized
       }
       r.hasZone = !!z;
-      if (z) { r.zoneTok = z.tok; r.zoneRegion = z.region; }
+      if (z) { r.zoneTok = z.tok; r.zoneRaw = z.raw; r.zoneRegion = z.region; }
       r.dayIdx = dayWord(text, r.s, r.e);
       out.push(r);
     }
@@ -432,13 +472,18 @@
     var t1 = zonedToMs(src, y, mo, d, m.h1, m.mi1);
     var q1 = parts(dst, t1);
     var text = fmt(q1.h, q1.mi);
+    var q2 = null;
     if (m.h2 !== null) {
-      var q2 = parts(dst, zonedToMs(src, y, mo, d, m.h2, m.mi2));
+      q2 = parts(dst, zonedToMs(src, y, mo, d, m.h2, m.mi2));
       text += "-" + fmt(q2.h, q2.mi);
     }
     var delta = Math.round((Date.UTC(q1.y, q1.m - 1, q1.d) - Date.UTC(y, mo - 1, d)) / 864e5);
     return {
       text: text, delta: delta, t: t1,
+      // A range whose shown end reads earlier than its start runs past midnight into the next day.
+      rolls: q2 ? rollsOver(q1.h, q1.mi, q2.h, q2.mi) : false,
+      // The destination wall time, for the capitals bar format.
+      capText: q2 ? rangeCap(q1.h, q1.mi, q2.h, q2.mi) : fmtCap(q1.h, q1.mi),
       sameOffset: offsetMin(src, t1) === offsetMin(dst, t1),
       srcText: fmt(m.h1, m.mi1) + (m.h2 !== null ? "-" + fmt(m.h2, m.mi2) : ""),
       dayIdx: m.dayIdx === null ? null : (m.dayIdx + delta + 7) % 7
@@ -446,6 +491,12 @@
   }
 
   function dayShift(delta) { return delta ? " " + (delta > 0 ? "+" : "-") + Math.abs(delta) + "d" : ""; }
+  // The whole-day shift of a time, plus the marker for a range that ends after midnight. A time
+  // already carrying a day shift does not get a second one.
+  function shiftFor(c, m) {
+    var shift = m.dayIdx === null ? dayShift(c.delta) : "";
+    return shift || (c.rolls ? " +1d" : "");
+  }
 
   // ---- Read side ----
   // Display name -> "F.Lastname": Maria Santos -> M.Santos, "Santos, Maria" -> M.Santos,
@@ -456,7 +507,7 @@
   // Courtesy titles before the first name.
   var TITLE = /^(?:dr|mr|mrs|ms|miss|mx|prof|professor|rev|fr|sr|capt|col|gen|lt|sgt|hon|sir)\.?[ \u00a0]+/i;
   // Suffixes and credentials after the surname. They never become the surname.
-  var SUFFIX = /^(?:jr|sr|ii|iii|iv|v|vi|md|do|dds|dvm|rn|np|pa|phd|edd|psyd|jd|esq|cpa|cfa|cfp|pe|pmp|mba|ma|ms|msc|bs|ba|mph|lcsw|cpc|rhit|emeritus|retired|ret)\.?$/i;
+  var SUFFIX = /^(?:jr|sr|ii|iii|iv|v|vi|md|do|dds|dvm|rn|np|pa|phd|edd|psyd|jd|esq|cpa|cfa|cfp|cpm|pe|pmp|mba|ma|ms|msc|bs|ba|mph|lcsw|cpc|rhit|emeritus|retired|ret)\.?$/i;
   // A company or team tail after a dash or a pipe ("Maria Santos - Acme", "Maria Santos | Acme").
   var ORG_TAIL = /[ \u00a0]*[|\u2502][^|\u2502]*$|[ \u00a0]+[-\u2013\u2014][ \u00a0]+.*$/;
   // The first code point, so an emoji or other astral character is never split in half.
@@ -504,8 +555,10 @@
       n = n.replace(TITLE, "").replace(ORG_TAIL, "").trim();
       if (!n) return cleaned.slice(0, MAX_NAME);
       var words = n.split(/[ \u00a0]+/);
-      // Strip trailing suffixes and credentials ("Jr.", "III", "PhD") so they never read as surname.
-      while (words.length > 1 && SUFFIX.test(words[words.length - 1])) words.pop();
+      // A suffix or credential is only stripped when the name has a first name, a surname, and the
+      // suffix on top of them ("Maria Santos Jr."). With two words the second word is the surname,
+      // even when it reads like a credential: "Linh Do", "Jack Ma", "Lan Vi".
+      while (words.length > 2 && SUFFIX.test(words[words.length - 1])) words.pop();
       first = words[0];
       rest = words.slice(1);
     }
@@ -524,7 +577,8 @@
   // ---- One time, formatted for a list of people ----
   // o: {sender: {name, zone}, readerTz, others: [{name, zone}], refMs, level, names}
   // level 0: two names per segment. 1: one name + count. 2: counts only.
-  // names false: no names at all (used for the second and later times in the bar).
+  // names false: no names at all (used for the second and later bars).
+  // Shape: "<reader time>  <-  <sender time>  <sender name>" then any other zones after " | ".
   function timeForPeople(m, o) {
     var src = m.zoneRegion, refMs = o.refMs, readerTz = o.readerTz, level = o.level || 0;
     var withNames = o.names !== false;
@@ -539,8 +593,7 @@
     var senderName = withNames ? shortName(o.sender && o.sender.name) : "";
     gs.count++;
     if (senderName) gs.names.push(senderName);
-    gr.count++;
-    if (withNames) gr.names.push("you");
+    // The reader is never named on the bar: "you" was dropped in 0.1.2.
     (o.others || []).forEach(function (p) {
       // A person with a missing or unusable zone is left out silently: never throw on a bad zone.
       if (!p || !validZone(p.zone)) return;
@@ -554,27 +607,36 @@
     var ordered = [gs].concat(gr === gs ? [] : [gr]).concat(rest);
     var extraZones = ordered.length > 4 ? ordered.length - 4 : 0;
 
-    function seg(g) {
-      var txt, shift = "";
-      if (g === gs) {
-        txt = (m.dayIdx === null ? "" : DAYS[m.dayIdx] + " ") + m.text.replace(/[\s\u00a0]+/g, " ");
-      } else {
-        var c = conv(m, src, g.zone, refMs);
-        txt = (m.dayIdx !== null && c.delta ? DAYS[c.dayIdx] + " " : "") + c.text + " " + labelFor(g.zone, t);
-        if (m.dayIdx === null) shift = dayShift(c.delta);
-      }
-      // The rollover marker belongs to the time, so it sits right after the time and its zone
-      // label, before any names or counts: "11pm AZ -1d you +1", never "you +1 -1d".
-      txt += shift;
-      if (!withNames) return txt;
-      if (level >= 2) return txt + " +" + g.count;
+    // The people on a zone, appended to that zone's time.
+    function who(g, names) {
+      if (!withNames || !names.length && !g.count) return "";
+      if (level >= 2) return g.count ? "  +" + g.count : "";
       var max = level >= 1 ? 1 : 2;
-      var shown = g.names.slice(0, max), more = g.count - shown.length;
-      if (!shown.length) return txt + (g.count ? " +" + g.count : "");
-      return txt + " " + shown.join(", ") + (more > 0 ? " +" + more : "");
+      var shown = names.slice(0, max), more = g.count - shown.length;
+      if (!shown.length) return g.count ? "  +" + g.count : "";
+      return "  " + shown.join(", ") + (more > 0 ? " +" + more : "");
     }
-    return ordered.slice(0, 4).map(seg).join(" | ") +
-      (extraZones ? " | +" + extraZones + " more zones" : "");
+    // The reader's own segment: weekday (when the sender wrote one) then the time, then the label.
+    function readerSeg() {
+      var day = m.dayIdx !== null ? DAYS[cRead.dayIdx].toUpperCase() + " " : "";
+      var shift = shiftFor(cRead, m);
+      return day + cRead.capText + " " + labelFor(readerTz, t) + shift + who(gr, gr.names);
+    }
+    // The sender's own segment: their time and their zone word, as they wrote it.
+    function senderSeg() {
+      var roll = rollsOver(m.h1, m.mi1, m.h2, m.mi2) ? " +1d" : "";
+      return senderCap(m) + " " + senderZone(m) + roll + who(gs, gs.names);
+    }
+    function otherSeg(g) {
+      var c = conv(m, src, g.zone, refMs);
+      var day = m.dayIdx !== null && c.delta ? DAYS[c.dayIdx].toUpperCase() + " " : "";
+      var shift = shiftFor(c, m);
+      return day + c.capText + " " + labelFor(g.zone, t) + shift + who(g, g.names);
+    }
+    var bar = gr === gs ? readerSeg() : readerSeg() + "  <-  " + senderSeg();
+    var tail = rest.slice(0, gr === gs ? 3 : 2).map(otherSeg);
+    if (tail.length) bar += " | " + tail.join(" | ");
+    return bar + (extraZones ? " | +" + extraZones + " more zones" : "");
   }
 
   // Cut the quoted thread and signature-style tails so old messages' times are ignored.
@@ -590,7 +652,8 @@
     return out.join("\n");
   }
 
-  // o: {displayName, refMs, deviceTz, others}. Returns bar text or null.
+  // o: {displayName, refMs, deviceTz, others}. Returns an array of bar strings (one per time),
+  // or null when there is no time to show. Times 2 and later carry no names.
   // others (version 0.2): [{name, zone}] for the other people on the message.
   function readerBar(text, o) {
     var items = [], seen = {}, body = stripQuoted(text);
@@ -614,44 +677,48 @@
     });
     if (!items.length) return null;
     var sender = { name: o.displayName, zone: null };
-    function build(k, level) {
-      var segs = items.slice(0, k).map(function (m, i) {
-        return timeForPeople(m, {
-          sender: sender, readerTz: o.deviceTz, others: o.others, refMs: o.refMs,
-          level: level, names: i === 0
-        });
+    // Outlook allows at most 5 notifications on a message; the add-in uses at most 4 bars.
+    var shown = Math.min(items.length, MAX_BARS);
+    var extra = items.length - shown;
+    function build(i, level) {
+      var bar = timeForPeople(items[i], {
+        sender: sender, readerTz: o.deviceTz, others: o.others, refMs: o.refMs,
+        level: level, names: i === 0
       });
-      return segs.join(" · ") + (k < items.length ? " +" + (items.length - k) + " more" : "");
+      // The last bar carries the count of times that did not get one. Two counts at the end of one
+      // bar read as one number, so the times count wins and the zones count comes off.
+      if (i === shown - 1 && extra) {
+        bar = bar.replace(/ \| \+\d+ more zones$/, "");
+        bar += "  +" + extra + " more";
+      }
+      return bar;
     }
     try {
-      // Shorten in order: two names, one name + count, counts only, then drop later times.
-      for (var level = 0; level <= 2; level++) {
-        var bar = build(items.length, level);
-        if (bar.length <= MAX_BAR) return bar;
+      var bars = [];
+      for (var i = 0; i < shown; i++) {
+        // Shorten this bar in the usual order: two names, one name + count, counts only.
+        var bar = null;
+        for (var level = 0; level <= 2; level++) {
+          bar = build(i, level);
+          if (bar.length <= MAX_BAR) break;
+        }
+        // A time was found, so a bar is never dropped: fall back to the short two-part form.
+        bars.push(bar.length <= MAX_BAR ? bar : lastResort(items[i], sender, o));
       }
-      for (var k = items.length - 1; k > 0; k--) {
-        var b2 = build(k, 2);
-        if (b2.length <= MAX_BAR) return b2;
-      }
-      // A time was found, so the bar is never dropped: fall back to the first time alone, as the
-      // written time with the sender and the reader's time. Still too long: echo the short form.
-      return lastResort(items[0], sender, o);
+      return bars;
     } catch (e) {
       return null;
     }
   }
 
-  // Two segments for one time: "<written time> <sender> | <time> <label> you".
+  // The shortest form of one bar: "<reader time> <label>  <-  <written time> <zone>".
   function lastResort(m, sender, o) {
     var c = conv(m, m.zoneRegion, o.deviceTz, o.refMs);
-    var mine = c.text + " " + labelFor(o.deviceTz, c.t) + dayShift(c.delta) + " you";
-    var who = shortName(sender.name);
-    var written = (m.dayIdx === null ? "" : DAYS[m.dayIdx] + " ") + m.text.replace(/[\s\u00a0]+/g, " ");
-    var bar = written + (who ? " " + who : "") + " | " + mine;
-    if (bar.length <= MAX_BAR) return bar;
-    // Shorten the echoed written time to its own "h[:mm]am/pm ZONE" form.
-    var shortWritten = (m.dayIdx === null ? "" : DAYS[m.dayIdx] + " ") + c.srcText + " " + m.zoneTok;
-    return (shortWritten + (who ? " " + who : "") + " | " + mine).slice(0, MAX_BAR);
+    var day = m.dayIdx === null ? "" : DAYS[c.dayIdx].toUpperCase() + " ";
+    var shift = shiftFor(c, m);
+    var mine = day + c.capText + " " + labelFor(o.deviceTz, c.t) + shift;
+    var roll = rollsOver(m.h1, m.mi1, m.h2, m.mi2) ? " +1d" : "";
+    return (mine + "  <-  " + senderCap(m) + " " + senderZone(m) + roll).slice(0, MAX_BAR);
   }
 
   // ---- Compose side ----
@@ -691,6 +758,7 @@
 
   return {
     ZONES: ZONES, LABELS: LABELS, TARGETS: TARGETS, MAX_BAR: MAX_BAR,
+    MAX_BARS: MAX_BARS, BAR_KEYS: BAR_KEYS,
     findTimes: findTimes, readerBar: readerBar, rewriteText: rewriteText,
     timeForPeople: timeForPeople, shortName: shortName,
     firstName: firstName, stripQuoted: stripQuoted
