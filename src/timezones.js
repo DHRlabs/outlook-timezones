@@ -120,12 +120,17 @@
     return fmtCap(h1, mi1) + "-" + fmtCap(h2, mi2);
   }
   // The sender's own time, normalized the same way. "noon"/"midnight" stay as written, capitalized.
+  // capOverride: an assumed time shows its clock as the add-in writes it ("5pm"), not in capitals,
+  // so the "assumed" note beside it reads as one phrase.
   function senderCap(m) {
+    if (m.capOverride) return m.capOverride;
     return m.word ? m.word.toUpperCase() : rangeCap(m.h1, m.mi1, m.h2, m.mi2);
   }
   // The sender's zone word as they wrote it: abbreviations upper-cased, spelled-out names
   // capitalized so a lowercase "eastern" reads as "Eastern" on the bar.
+  // zoneOverride: the "assumed UTC-5" note for a time the sender wrote no zone on.
   function senderZone(m) {
+    if (m.zoneOverride) return m.zoneOverride;
     var raw = m.zoneRaw || m.zoneTok || "";
     if (raw.length <= 4) return raw.toUpperCase();
     return raw.replace(/[A-Za-z\u00c0-\u024f]+/g, function (w) {
@@ -173,6 +178,19 @@
     if (+hh > 14) return null;
     var z = (sign === "+" ? "+" : "-") + (hh.length < 2 ? "0" : "") + hh + ":" + (mm || "00");
     return validZone(z) ? z : null;
+  }
+  // A whole-minute UTC offset (from a message's Date header) as an Intl offset zone.
+  // 0 is not used: a +0000 Date header is the one this add-in does not read (AGENTS.md).
+  function offsetZoneFromMin(min) {
+    if (typeof min !== "number" || !isFinite(min) || !min) return null;
+    var a = Math.abs(Math.round(min)), hh = Math.floor(a / 60), mm = a % 60;
+    if (hh > 14) return null;
+    return offsetZone(min < 0 ? "-" : "+", String(hh), (mm < 10 ? "0" : "") + mm);
+  }
+  // The same offset as a reader-facing label: "UTC-5", "UTC+5:30".
+  function offsetLabel(min) {
+    var a = Math.abs(Math.round(min)), hh = Math.floor(a / 60), mm = a % 60;
+    return "UTC" + (min < 0 ? "-" : "+") + hh + (mm ? ":" + (mm < 10 ? "0" : "") + mm : "");
   }
 
   // Zone written right after a time: {len, tok, region}, SKIP, or null.
@@ -230,10 +248,19 @@
     LB + "(?<mh>\\d{3,4})[ \\u00a0]?(?<munit>hrs?\\.?|hours|h)(?![A-Za-z])",
     "(?<![\\w])(?<nm>noon|midnight)\\b"
   ];
+  // The bare-hour branch: a number with no am, pm or minutes of its own. Read side only
+  // (AGENTS.md), so it is a separate branch that findTimes adds only when the caller asks for it.
+  // A zone word or a joined time is required (decided in handle), so a bare number anywhere else
+  // is never a time. The lookahead keeps this branch off numbers that are not followed by a word
+  // at all, and the guard after the digits keeps it off longer numbers, clocks, and decimals.
+  var RE_BARE = LB + "(?<bh>\\d{1,2})(?![\\d:.])(?=[ \\u00a0]{0,2}[A-Za-z]|[ \\u00a0]?[&\\/])";
+  // Compose uses the plain sources, which are exactly what version 0.1.2 ran.
   var RE_SRC = RE_PARTS.join("|");
-  // The same finder with the range branch removed. Used to re-read the span of a range that was
+  var RE_SRC_BARE = RE_SRC + "|" + RE_BARE;
+  // The same finders with the range branch removed. Used to re-read the span of a range that was
   // rejected ("step 2pm to 3pm", "10am and 2pm"), so every real time inside it is still found.
   var RE_NORANGE = RE_PARTS.slice(1).join("|");
+  var RE_NORANGE_BARE = RE_NORANGE + "|" + RE_BARE;
 
   var DAYRE = "sunday|monday|tuesday|wednesday|thursday|friday|saturday|sun|mon|tues|tue|wed|thurs|thur|thu|fri|sat";
   var DAY_BEFORE = new RegExp("\\b(" + DAYRE + ")\\b\\.?,?[ \\u00a0]*(?:(?:at|@|from|by|around|on)\\b[ \\u00a0]*)?$", "i");
@@ -279,11 +306,45 @@
     return isDay(m) ? DAYIDX[m[1].slice(0, 3).toLowerCase()] : null;
   }
 
+  // ---- Bare hours (read side only) ----
+  // A bare hour joined by or, and, / or & to a following time that carries a meridiem AND a zone
+  // word: "4 or 5pm cst", "4/5pm ET", "4 & 5 PM ET". The bare hour shares that meridiem and zone.
+  // Groups: 1 hour, 2 minutes, 3 meridiem.
+  var BARE_JOIN = new RegExp("^[ \\u00a0]*(?:and\\/or|or|and|&|\\/)[ \\u00a0]*" +
+    "(?:(?:at|maybe|either)[ \\u00a0]+)?(\\d{1,2})(?:[:.](\\d{2})(?!\\d))?[ \\u00a0]?(" + MER + ")", "id");
+  // A joiner glued to the number after it ("4/5pm ET") blocks that number's left boundary, so the
+  // main scan never reaches it and this branch reads it instead. These are the characters the
+  // left-boundary guard (LB) refuses.
+  var JOIN_BLOCKED = /[\w$.:\/@#-]/;
+  // The hour's own reading when it stands on a zone word: 8 to 11 is AM, 12 and 1 to 7 are PM.
+  function bareHour24(h) { return h >= 8 && h <= 11 ? h : (h % 12) + 12; }
+  // A month name before the number ("Dec 5 CT", "Nov 5 or 6pm ET"): the number is a date.
+  var MONTH_BEFORE = /(?:^|[^A-Za-z])(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\.?[ \u00a0]*$/i;
+  // A comma right before the number ("1,5 ET"): part of a longer number, not an hour.
+  // The other characters in the never-list ($ . / : digits, word characters) are already refused
+  // by the left-boundary guard LB.
+  var COMMA_BEFORE = /,[ \u00a0]*$/;
+  // The words that let a lower-case abbreviation count ("at 3 et", "do 2 pt").
+  var CUE_BEFORE = /(?:^|[^A-Za-z])(?:at|by|around|before|after|until|from|to|or|do)[ \u00a0]+$|@[ \u00a0]*$/i;
+  // The zone word has to sit right after the hour, separated by spaces only: a slash, comma or
+  // dash separator ("5/ET", "1,5 ET") is not a bare hour on a zone.
+  var BARE_ZONE_SEP = /^[ \u00a0]{0,2}[A-Za-z]/;
+  // A time with a meridiem joined just before the hour ("7 pm or 8 ET"): the hour takes its
+  // meridiem rather than the 8-to-11 reading. Group 1 is a or p.
+  var BARE_PREV_MER = new RegExp("\\d{1,2}(?:[:.]\\d{2})?[ \\u00a0]?([ap])\\.?m?\\.?[ \\u00a0]*" +
+    "(?:and\\/or|or|and|&|\\/)[ \\u00a0]*$", "i");
+  // After the zone word on a bare hour: the clause has to end there, with punctuation, or with one
+  // of the function words from the name rule ("2 ET", "2 PT?", "2 pacific works"). Any other word
+  // means the number was counting something ("7 CT scans", "5 central themes").
+  function clauseEnds(after) { return NAME_END.test(after); }
+
   // Returns matches: {s, e, text, h1, mi1, h2, mi2, zoneTok, hasZone, dayIdx}
   // Times with an invalid shape are consumed and dropped, never half-converted.
   // refMs: the message or draft date, used to tell whether a "4pm ET / 1pm PT" pair is one instant.
-  function findTimes(text, refMs) {
-    var re = new RegExp(RE_SRC, "gid"), out = [], m;
+  // bare: read the bare-hour forms too ("2 pacific", "4 or 5pm cst"). Read side only; compose
+  // leaves it off, so its output is exactly what version 0.1.2 gave (AGENTS.md).
+  function findTimes(text, refMs, bare) {
+    var re = new RegExp(bare ? RE_SRC_BARE : RE_SRC, "gid"), out = [], m;
     var refForPair = refMs || Date.now();
     while ((m = re.exec(text))) {
       var g0 = m.groups, ms = m.index, me = ms + m[0].length;
@@ -299,7 +360,7 @@
           // resume at the closing number itself, so it can still open a range of its own
           // ("4pm and 2pm to 6pm") and no time on either side of the separator is lost.
           var cut = m.indices.groups.rh2[0];
-          var sub = new RegExp(RE_NORANGE, "gi"), sm;
+          var sub = new RegExp(bare ? RE_NORANGE_BARE : RE_NORANGE, "gi"), sm;
           sub.lastIndex = ms;
           while ((sm = sub.exec(text)) && sm.index < cut) handle(sm);
           re.lastIndex = cut;
@@ -311,8 +372,34 @@
     function handle(m) {
       var g = m.groups, r = { s: m.index, e: m.index + m[0].length, text: m[0], h2: null, mi2: null };
       var before = text.slice(Math.max(0, r.s - 30), r.s);
-      var z = zoneAfter(text.slice(r.e, r.e + 60));
-      if (z === SKIP || (!z && g.sh === undefined && g.rh1 === undefined)) return;
+      var afterRaw = text.slice(r.e, r.e + 60);
+      var z = zoneAfter(afterRaw);
+      // A bare hour is a time only with an accepted zone word right after it, or when it is joined
+      // to a following time that carries both a meridiem and a zone word. Everything else
+      // ("3 a day", "2 people", "version 2") is an ordinary number and is left alone.
+      var join = null, joinHidden = false, prevMer = null, bareOwnZone = false;
+      if (g.bh !== undefined) {
+        if (z === SKIP) return;
+        // Never when the number counts something else, follows a month name, or follows a comma.
+        // The other characters in the never-list (a slash, a period, a currency sign, another
+        // digit) are already refused by the left-boundary guard LB.
+        if (RANGE_UNIT_BEFORE.test(before) || MONTH_BEFORE.test(before) || COMMA_BEFORE.test(before)) return;
+        if (z) {
+          // The zone word has to sit right after the hour with nothing but spaces between them,
+          // and it has to close the clause: end, punctuation, or a function word. An abbreviation
+          // also has to be in capitals unless the hour follows a cue word ("at 3 et").
+          if (!BARE_ZONE_SEP.test(afterRaw)) return;
+          if (!clauseEnds(afterRaw.slice(z.len))) return;
+          if (z.raw.length <= 4 && z.raw !== z.raw.toUpperCase() && !CUE_BEFORE.test(before)) return;
+          prevMer = BARE_PREV_MER.exec(before);
+          bareOwnZone = true;
+        } else {
+          join = BARE_JOIN.exec(afterRaw);
+          if (!join) return;
+          joinHidden = JOIN_BLOCKED.test(join[0].charAt(join.indices[1][0] - 1));
+        }
+      }
+      if (z === SKIP || (!z && !join && g.sh === undefined && g.rh1 === undefined)) return;
       if (z) { r.e += z.len; r.text = text.slice(r.s, r.e); }
       var after = text.slice(r.e, r.e + 40);
       // The word the time sits in, for the glued-token guard below. A slash ends the word the same
@@ -320,7 +407,10 @@
       // across the slash and hides the time after it.
       var tokS = text.slice(0, r.s).search(/[^\s\/]*$/), tokE = r.s + text.slice(r.s).search(/[\s\/]|$/);
       if (/[@+]/.test(text.slice(tokS, tokE)) || UNIT_BEFORE.test(before)) return;
-      if (RANGE_BEFORE.test(before) || RANGE_AFTER.test(after)) return;
+      // The half-range guards are about a time whose other end has no meridiem ("2pm-3"). A bare
+      // hour standing on its own zone word is already a whole time, so a dash beside it is just a
+      // separator between two of them ("2 ET - 3 ET") and neither end is dropped.
+      if (!bareOwnZone && (RANGE_BEFORE.test(before) || RANGE_AFTER.test(after))) return;
       if (g.rh1 !== undefined) {
         var h1 = +g.rh1, h2 = +g.rh2, m1 = g.rm1 ? +g.rm1 : 0, m2 = g.rm2 ? +g.rm2 : 0;
         if (h1 < 1 || h1 > 12 || h2 < 1 || h2 > 12 || m1 > 59 || m2 > 59) return;
@@ -342,14 +432,56 @@
         var ms4 = g.mh.length === 3 ? "0" + g.mh : g.mh, mhv = +ms4.slice(0, 2), mmv = +ms4.slice(2);
         if (mhv > 23 || mmv > 59) return;
         r.h1 = mhv; r.mi1 = mmv;
+      } else if (g.bh !== undefined) {
+        var bh = +g.bh;
+        if (bh < 1 || bh > 12) return;
+        if (join) {
+          // Joined to a following time that has a meridiem and a zone word: the bare hour is a
+          // second time in that zone, so "4 or 5pm cst" is 4pm CST and 5pm CST. With no zone word
+          // on the following time there is nothing to borrow, so the bare hour is not a time.
+          var jm = +join[1], jmi = join[2] ? +join[2] : 0;
+          if (jm < 1 || jm > 12 || jmi > 59) return;
+          var jz = zoneAfter(text.slice(r.e + join[0].length, r.e + join[0].length + 60));
+          if (!jz || jz === SKIP) return;
+          var jc = join[3].toLowerCase()[0], j24 = to24(jm, jc);
+          // The meridiem is the one that puts the bare hour at or before the following time, so
+          // "11 or 12pm ET" is 11 AM and "4 or 5pm cst" is 4 PM.
+          var same = to24(bh, jc);
+          r.h1 = same * 60 <= j24 * 60 + jmi ? same : to24(bh, jc === "p" ? "a" : "p");
+          r.mi1 = 0;
+          z = jz;
+        } else if (prevMer) {
+          // A joined time with a meridiem sits just before it ("7 pm or 8 ET"): take that meridiem.
+          r.h1 = to24(bh, prevMer[1].toLowerCase()); r.mi1 = 0;
+        } else {
+          // Standing on its own zone word: 8 to 11 is AM, 12 and 1 to 7 are PM.
+          r.h1 = bareHour24(bh); r.mi1 = 0;
+        }
       } else {
         r.h1 = g.nm.toLowerCase() === "noon" ? 12 : 0; r.mi1 = 0;
         r.word = g.nm; // "noon"/"midnight": shown as written, capitalized
       }
       r.hasZone = !!z;
+      // Which bare-hour rule read this one, for the read side and for a differential run:
+      // "zone" is a bare hour on its own zone word, "join" one joined to a zoned time.
+      if (g.bh !== undefined) r.bareRule = join ? "join" : "zone";
       if (z) { r.zoneTok = z.tok; r.zoneRaw = z.raw; r.zoneRegion = z.region; }
       r.dayIdx = dayWord(text, r.s, r.e);
       out.push(r);
+      // A joiner glued to the number after it ("4/5pm ET") blocks that number's left boundary, so
+      // the joined time is read here. With any other joiner the main scan reaches it itself.
+      if (join && joinHidden) {
+        var ji = join.indices[1];
+        var j2 = {
+          s: r.e + ji[0], e: r.e + join[0].length, text: join[0].slice(ji[0]), h2: null, mi2: null,
+          h1: to24(+join[1], join[3].toLowerCase()[0]), mi1: join[2] ? +join[2] : 0,
+          hasZone: r.hasZone, dayIdx: r.dayIdx
+        };
+        if (z) { j2.e += z.len; j2.zoneTok = z.tok; j2.zoneRaw = z.raw; j2.zoneRegion = z.region; }
+        out.push(j2);
+        // The scan resumes past the joined time, so it is never found a second time.
+        if (re.lastIndex < j2.e) re.lastIndex = j2.e;
+      }
     }
     // "4pm ET / 1pm PT": the writer already gave both zones for ONE instant, so it is one time
     // written twice. Two different instants ("Options 2pm ET / 3pm CT") are two times, and a bare
@@ -498,6 +630,27 @@
     return shift || (c.rolls ? " +1d" : "");
   }
 
+  // ---- Message Date header ----
+  // The UTC offset of the message's own clock, in minutes, from raw internet headers.
+  // Folded continuation lines are joined first. A zone written as a name only ("Date: ... GMT"),
+  // a missing or unreadable header, and +0000 all give null: the add-in shows no bar for a time
+  // with no zone rather than guessing (AGENTS.md).
+  function senderOffsetFromHeaders(headers) {
+    var text = String(headers || "").replace(/\r\n|\r/g, "\n").replace(/\n[ \t]+/g, " ");
+    var line = null;
+    text.split("\n").forEach(function (l) {
+      if (line === null && /^date[ \t]*:/i.test(l)) line = l;
+    });
+    if (line === null) return null;
+    // The numeric offset, ahead of any trailing "(MST)" comment the sender's client added.
+    var m = /([+\-])(\d{2})(\d{2})(?!\d)/.exec(line.replace(/\([^()]*\)/g, " "));
+    if (!m) return null;
+    var hh = +m[2], mm = +m[3];
+    if (hh > 14 || mm > 59) return null;
+    var min = (m[1] === "-" ? -1 : 1) * (hh * 60 + mm);
+    return min ? min : null; // +0000: no bar for a time with no written zone
+  }
+
   // ---- Read side ----
   // Display name -> "F.Lastname": Maria Santos -> M.Santos, "Santos, Maria" -> M.Santos,
   // Maria -> Maria, "Maria de la Cruz" -> M.Cruz (last word only when the surname is several words).
@@ -582,6 +735,9 @@
   function timeForPeople(m, o) {
     var src = m.zoneRegion, refMs = o.refMs, readerTz = o.readerTz, level = o.level || 0;
     var withNames = o.names !== false;
+    // An assumed time always shows both halves: the "assumed UTC-5" note is the whole point of the
+    // bar, so it stays even when the sender's mail clock is the reader's own offset (AGENTS.md).
+    var forceSplit = !!m.zoneOverride;
     var cRead = conv(m, src, readerTz, refMs), t = cRead.t;
     var groups = [], byOff = {};
     function group(zone) {
@@ -620,7 +776,10 @@
     function readerSeg() {
       var day = m.dayIdx !== null ? DAYS[cRead.dayIdx].toUpperCase() + " " : "";
       var shift = shiftFor(cRead, m);
-      return day + cRead.capText + " " + labelFor(readerTz, t) + shift + who(gr, gr.names);
+      // With an assumed zone the sender's own segment is always written, and it is the one that
+      // carries their name, so the reader's segment does not repeat it.
+      var people = forceSplit && gr === gs ? "" : who(gr, gr.names);
+      return day + cRead.capText + " " + labelFor(readerTz, t) + shift + people;
     }
     // The sender's own segment: their time and their zone word, as they wrote it.
     function senderSeg() {
@@ -633,7 +792,7 @@
       var shift = shiftFor(c, m);
       return day + c.capText + " " + labelFor(g.zone, t) + shift + who(g, g.names);
     }
-    var bar = gr === gs ? readerSeg() : readerSeg() + "  <-  " + senderSeg();
+    var bar = gr === gs && !forceSplit ? readerSeg() : readerSeg() + "  <-  " + senderSeg();
     var tail = rest.slice(0, gr === gs ? 3 : 2).map(otherSeg);
     if (tail.length) bar += " | " + tail.join(" | ");
     return bar + (extraZones ? " | +" + extraZones + " more zones" : "");
@@ -652,27 +811,56 @@
     return out.join("\n");
   }
 
-  // o: {displayName, refMs, deviceTz, others}. Returns an array of bar strings (one per time),
-  // or null when there is no time to show. Times 2 and later carry no names.
+  // A time the sender wrote no zone on, prepared for the bar: the same match, converted from the
+  // mail clock and shown as "5pm assumed UTC-5" on the sender's side.
+  function assumedItem(m, src, offMin) {
+    var copy = {};
+    for (var k in m) if (Object.prototype.hasOwnProperty.call(m, k)) copy[k] = m[k];
+    copy.zoneRegion = src;
+    copy.hasZone = true;
+    copy.capOverride = m.word ? m.word.toLowerCase()
+      : fmt(m.h1, m.mi1) + (m.h2 !== null ? "-" + fmt(m.h2, m.mi2) : "");
+    copy.zoneOverride = "assumed " + offsetLabel(offMin);
+    return copy;
+  }
+
+  // o: {displayName, refMs, deviceTz, others, senderOffsetMin}. Returns an array of bar strings
+  // (one per time), or null when there is no time to show. Times 2 and later carry no names.
   // others (version 0.2): [{name, zone}] for the other people on the message.
+  // senderOffsetMin: the UTC offset of the message's Date header, in minutes. A time with no zone
+  // written is converted from that offset and marked "assumed". Missing, unreadable, or +0000
+  // (which is 0 and so falsy here): that time gets no bar.
   function readerBar(text, o) {
     var items = [], seen = {}, body = stripQuoted(text);
     if (!validZone(o.deviceTz)) return null;
     var own = ownSpans(body);
-    findTimes(body, o.refMs).forEach(function (m) {
-      if (!m.hasZone || !m.zoneRegion) return;   // no zone written: show nothing, never guess
-      if (m.pairTail) return;                    // "4pm ET / 1pm PT": one time, read from the first zone
-      if (!validZone(m.zoneRegion)) return;      // an offset the platform will not take: skip the time
+    var assumedZone = offsetZoneFromMin(o.senderOffsetMin);
+    findTimes(body, o.refMs, true).forEach(function (m) {
       // A bracket group this add-in wrote holds a time already shown by the time before it. Any
       // other bracket ("see [notes: 4pm ET]") is ordinary prose and is read normally.
       if (inOwnBracket(own, m.s)) return;
+      if (m.pairTail) return;                    // "4pm ET / 1pm PT": one time, read from the first zone
+      var src, assumed = false;
+      if (m.hasZone) {
+        if (!m.zoneRegion) return;
+        src = m.zoneRegion;
+      } else {
+        // No zone written. A bare time joined to a zoned one is the writer's own pair and is left
+        // alone (AGENTS.md joiner rule). Otherwise it is read on the sender's mail clock.
+        if (m.nextToZoned || !assumedZone) return;
+        src = assumedZone;
+        assumed = true;
+      }
+      if (!validZone(src)) return;               // an offset the platform will not take: skip the time
       try {
-        var c = conv(m, m.zoneRegion, o.deviceTz, o.refMs);
-        if (c.sameOffset) return;
-        var key = (m.dayIdx === null ? "" : m.dayIdx) + "|" + c.srcText + "|" + m.zoneTok;
+        var c = conv(m, src, o.deviceTz, o.refMs);
+        // A written zone that is already the reader's own offset says nothing new, so no bar.
+        // An assumed zone still gets one: the bar is what tells the reader it was assumed.
+        if (c.sameOffset && !assumed) return;
+        var key = (m.dayIdx === null ? "" : m.dayIdx) + "|" + c.srcText + "|" + (assumed ? "~" : m.zoneTok);
         if (seen[key]) return;
         seen[key] = 1;
-        items.push(m);
+        items.push(assumed ? assumedItem(m, src, o.senderOffsetMin) : m);
       } catch (e) { /* a zone Intl refuses: skip this time, never break the bar */ }
     });
     if (!items.length) return null;
@@ -761,6 +949,7 @@
     MAX_BARS: MAX_BARS, BAR_KEYS: BAR_KEYS,
     findTimes: findTimes, readerBar: readerBar, rewriteText: rewriteText,
     timeForPeople: timeForPeople, shortName: shortName,
-    firstName: firstName, stripQuoted: stripQuoted
+    firstName: firstName, stripQuoted: stripQuoted,
+    senderOffsetFromHeaders: senderOffsetFromHeaders
   };
 });

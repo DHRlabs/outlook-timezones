@@ -12,6 +12,12 @@
       font: 14px -apple-system, "Segoe UI", system-ui, sans-serif;
       background: Canvas; color: CanvasText;
     }
+    /* One entry per time: the reader's own time large and bold, the sender's line under it. */
+    .otz-row { margin: 0 0 14px; }
+    .otz-row:last-child { margin-bottom: 0; }
+    .otz-mine { font-size: 22px; font-weight: 600; line-height: 1.2; }
+    .otz-from { font-size: 13px; opacity: 0.75; margin-top: 2px; }
+    .otz-none { margin: 0; font-size: 13px; opacity: 0.75; }
   </style>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="timezones.js"></script>
@@ -25,6 +31,6 @@
   </script>
 </head>
 <body>
-  <p>Time Zones</p>
+  <div id="otz-list"></div>
 </body>
 </html>
