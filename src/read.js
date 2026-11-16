@@ -39,29 +39,35 @@
   // The UTC offset of the message's own Date header, in minutes, or null. getAllInternetHeadersAsync
   // is requirement set 1.8 and is missing on older hosts, so it is feature-detected: without it the
   // add-in behaves as it did before, reading only times that carry a written zone.
-  // The callback runs exactly once: a header read that fails, throws, or never calls back at all
-  // still lets the message be handled, with no sender clock (AGENTS.md).
+  // A header read that fails, throws, or never calls back at all still lets the message be
+  // handled, with no sender clock (AGENTS.md). The 3 s wait is not the end of the story: it hands
+  // over no sender clock so the message is painted now, and a header result that arrives after it
+  // is handed over as well, so the same message is repainted with its assumed bars. The handover
+  // repeats only when the sender clock actually changed, so nothing repaints for nothing.
   var HEADER_WAIT = 3000;
   function withSenderOffset(item, done) {
-    var fired = false;
-    function once(off) {
-      if (fired) return;
-      fired = true;
+    var answered = false, handed = false, last = null;
+    function deliver(off) {
+      if (handed && off === last) return;
+      handed = true;
+      last = off;
       done(off);
     }
-    if (typeof item.getAllInternetHeadersAsync !== "function") return once(null);
+    if (typeof item.getAllInternetHeadersAsync !== "function") return deliver(null);
     // A host that accepts the call but never answers must not leave the pane on the last message.
-    setTimeout(function () { once(null); }, HEADER_WAIT);
+    setTimeout(function () { if (!answered) deliver(null); }, HEADER_WAIT);
     try {
       item.getAllInternetHeadersAsync(function (r) {
         var off = null;
         if (r && r.status === Office.AsyncResultStatus.Succeeded) {
           try { off = TZ.senderOffsetFromHeaders(r.value); } catch (e) { off = null; }
         }
-        once(off);
+        answered = true;
+        deliver(off);
       });
     } catch (e) {
-      once(null);
+      answered = true;
+      deliver(null);
     }
   }
 
@@ -88,6 +94,12 @@
     });
   }
 
+  // The body read waits at most this long. A host that accepts getAsync but never answers must
+  // still leave the message painted, with its bars cleared (AGENTS.md: the pane is never blank).
+  // It covers the body read only: once the body arrives this timer is cleared and the header wait
+  // (HEADER_WAIT above) is what decides, so a slow header read never cancels a body already read.
+  var BODY_WAIT = 5000;
+
   function update() {
     var item = Office.context.mailbox.item;
     // Read mode only: a pinned pane also fires for drafts (compose items have no displayReplyForm) and for no selection.
@@ -98,12 +110,28 @@
     // The message the pane is showing. A later callback for a message the user has left is dropped,
     // so a slow read never paints over the message now open.
     function current() { return Office.context.mailbox.item === item; }
+    // The waits above are what the message is painted with so far, never the last word: a body or
+    // a header result that arrives after its wait is still this message's own answer, so it
+    // repaints over the empty state the wait left. Only a callback for a message the user has
+    // since left is dropped. The same bars are never painted twice in a row.
+    var last = null;
+    function finish(bars) {
+      if (!current()) return;
+      var sig = bars.join("\n");
+      if (last === sig) return;
+      last = sig;
+      show(item, bars);
+    }
+    var bodyTimer = setTimeout(function () { finish([]); }, BODY_WAIT);
     try {
       item.body.getAsync(Office.CoercionType.Text, function (r) {
+        // The body is here, so its wait is over: a body that arrived after the wait still gets its
+        // bars, replacing the empty state the wait painted.
+        clearTimeout(bodyTimer);
         if (!current()) return;
         // The body could not be read: the message still gets a pane and cleared bars.
         if (!r || r.status !== Office.AsyncResultStatus.Succeeded) {
-          show(item, []);
+          finish([]);
           return;
         }
         withSenderOffset(item, function (senderOffsetMin) {
@@ -120,16 +148,29 @@
           } catch (e) {
             bars = []; // anything thrown inside the bar logic: no times rather than a stale pane
           }
-          show(item, bars);
+          finish(bars);
         });
       });
     } catch (e) {
-      show(item, []);
+      clearTimeout(bodyTimer);
+      finish([]);
     }
   }
 
+  // The pane's own document may still be parsing when Office is ready: paint only once
+  // "otz-list" can exist, so the first message is never dropped on a blank pane.
+  function whenDomReady(fn) {
+    if (document.readyState !== "loading") return fn();
+    document.addEventListener("DOMContentLoaded", fn);
+  }
+
   Office.onReady(function () {
-    Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, update);
-    update();
+    whenDomReady(function () {
+      // A host that refuses the handler registration must not cost the open message its bars.
+      try {
+        Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, update);
+      } catch (e) { /* no change events: the message now open is still painted below */ }
+      update();
+    });
   });
 })();

@@ -155,7 +155,14 @@
   var MER_END = "(?:(?![A-Za-z0-9])|(?=(?:" + ZONE_KEYS + ")(?![A-Za-z])))";
   // Zone after a time. Separator: none or one space, two spaces, "," ";" ":" "/" dashes, or "(" "[" with a close.
   // Groups: 1 open bracket, 2 world name phrase, 3 word, 4 "(Standard|Daylight) Time (zone)" tail.
-  var ZONE_AFTER = /^(?:[ \u00a0]{2}|[ \u00a0]?[,;:\/\-\u2013\u2014][ \u00a0]{0,2}|[ \u00a0]?([(\[])|[ \u00a0]?)(?:((central|eastern)[ \u00a0]+european(?:[ \u00a0]+summer)?[ \u00a0]+time(?:[ \u00a0]+zone)?)\b|([A-Za-z]+)((?:[ \u00a0]+(?:standard|daylight))?[ \u00a0]+time(?:[ \u00a0]+zone)?\b)?)/i;
+  // One white space class throughout: the read side normalizes the no-break spaces to plain spaces
+  // and collapses runs of them before parsing (normalizeRead), and a tab or line break is a hard
+  // separator that never joins a time to its zone word.
+  // The punctuation separator between a time and its zone word: one source for zoneAfter and for
+  // zoneSpanAfter (the refused-zone neighbors), so both accept the same separators.
+  var ZONE_SEP_PUNCT = /^[ \u00a0]?[,;:\/\-\u2013\u2014][ \u00a0]{0,2}/;
+  var ZONE_AFTER_TAIL = "[ \\u00a0]?([(\\[])|[ \\u00a0]?)(?:((central|eastern)[ \\u00a0]+european(?:[ \\u00a0]+summer)?[ \\u00a0]+time(?:[ \\u00a0]+zone)?)\\b|([A-Za-z]+)((?:[ \\u00a0]+(?:standard|daylight))?[ \\u00a0]+time(?:[ \\u00a0]+zone)?\\b)?)";
+  var ZONE_AFTER = new RegExp("^(?:[ \\u00a0]{2}|" + ZONE_SEP_PUNCT.source.slice(1) + "|" + ZONE_AFTER_TAIL, "i");
   // A spelled-out name (Eastern, Central...) with no "Time" is a zone at the end of a clause, before
   // punctuation (or the bracket this add-in wrote), or before a function word. Before any other word
   // ("Central Park") it is not read, and the time is left untouched (AGENTS.md zone invariant).
@@ -194,7 +201,9 @@
   }
 
   // Zone written right after a time: {len, tok, region}, SKIP, or null.
-  function zoneAfter(after) {
+  // read: the read side, which also refuses an offset written across a tab or a line break
+  // ("09:00 UTC\t-5"). Compose never passes it, so its output is unchanged.
+  function zoneAfter(after, read) {
     var m = ZONE_AFTER.exec(after), world = m && m[2] && WORLD_NAMES[m[3].toUpperCase()];
     var tok = world ? world[0] : m && m[4].toUpperCase(), z = world ? world[1] : m && zoneWord(m[4]), len;
     // The zone word exactly as the sender wrote it, for the read bar.
@@ -211,6 +220,10 @@
         // A sign that is not a readable offset ("UTC++5", "UTC+-5") is still an offset the writer
         // meant: the time is skipped whole rather than read as plain UTC.
         if (!off && /^[ \u00a0]?[+\-\u2212]/.test(after.slice(len))) return SKIP;
+        // On the read side a tab or a line break between the zone word and the offset is still an
+        // offset the writer wrote ("09:00 UTC\t-5"), so the time is left untouched rather than
+        // read as plain UTC. Compose never gets here (AGENTS.md zone invariant).
+        if (!off && read && /^\s*[+\-\u2212]\d/.test(after.slice(len))) return SKIP;
         if (reg) { z = reg; tok = tok + off[0].replace(/[ \u00a0]/g, ""); raw = tok; len += off[0].length; }
       }
       if (z && m[1]) {
@@ -234,6 +247,10 @@
     "|[.,;:!?)\\]\\r\\n]|$)";
   // Range separator. "and" counts only after "between" (checked in findTimes).
   var RSEP = "(?:[-\\u2013\\u2014]|\\bto\\b|\\band\\b)";
+  // The time forms. One white space class, the plain space and the no-break space, so compose runs
+  // exactly what version 0.1.2 ran. The read side normalizes its text first (normalizeRead), so a
+  // no-break or narrow space arrives here as a plain space and a run of spaces as one; a tab or a
+  // line break stays, and is a hard separator that never joins a clock to its meridiem or zone.
   var RE_PARTS = [
     // range: 2-3pm, 2pm-3pm, 2:30 to 3:30pm, 2.30-3.30pm, optional zone
     LB + "(?<rh1>\\d{1,2})(?:[:.](?<rm1>\\d{2})(?!\\d))?(?:[ \\u00a0]?(?<rmer1>" + MER + "))?[ \\u00a0]*" + RSEP + "[ \\u00a0]*" +
@@ -241,10 +258,12 @@
     // single: 4pm, 4 pm, 4:30 PM, 4.30pm, 4p, 4pmET, optional zone
     LB + "(?<sh>\\d{1,2})(?:[:.](?<sm>\\d{2})(?!\\d))?(?:[ \\u00a0]?(?<smer>" + MER + ")" + MER_END +
       "|(?<smer1>[ap])" + SMER1_END + ")",
-    // 24-hour clock: zone required (checked in findTimes). Dot minutes need a written meridiem,
-    // so a decimal with a unit after it ("18.40 MT", "Revenue grew 14.30 CT") is not a time.
+    // 24-hour clock: zone required on compose (checked in findTimes); on the read side a bare
+    // HH:MM is converted from the sender's mail clock. Dot minutes need a written meridiem, so a
+    // decimal with a unit after it ("18.40 MT", "Revenue grew 14.30 CT") is not a time.
     LB + "(?<hh>\\d{1,2}):(?<hm>[0-5]\\d)(?![\\w:.])",
-    // military with a unit word: 1600 hrs, 0930h. Zone required (checked in findTimes).
+    // military with a unit word: 1600 hrs, 0930h. Zone required on compose (checked in findTimes);
+    // on the read side a unit word alone is not enough, so "ran for 100 hours" stays a duration.
     LB + "(?<mh>\\d{3,4})[ \\u00a0]?(?<munit>hrs?\\.?|hours|h)(?![A-Za-z])",
     "(?<![\\w])(?<nm>noon|midnight)\\b"
   ];
@@ -254,13 +273,23 @@
   // is never a time. The lookahead keeps this branch off numbers that are not followed by a word
   // at all, and the guard after the digits keeps it off longer numbers, clocks, and decimals.
   var RE_BARE = LB + "(?<bh>\\d{1,2})(?![\\d:.])(?=[ \\u00a0]{0,2}[A-Za-z]|[ \\u00a0]?[&\\/])";
-  // Compose uses the plain sources, which are exactly what version 0.1.2 ran.
+  // "midday" reads as noon, on the read side only, so compose runs exactly the 0.1.2 source.
+  var RE_MIDDAY = "(?<![\\w])(?<md>midday|mid-day)\\b";
+  // The 24-hour branch for the read side only: a sentence period after the clock is punctuation,
+  // not part of a number, so "begins at 16:00." is a time. A period with a digit behind it is
+  // still a longer number ("16:00.5") and is refused, exactly as compose refuses it. Compose runs
+  // the branch in RE_PARTS unchanged, so its output stays byte-identical.
+  var RE_HHMM_READ = LB + "(?<hh>\\d{1,2}):(?<hm>[0-5]\\d)(?![\\w:])(?!\\.\\d)";
+  var RE_PARTS_READ = RE_PARTS.slice();
+  RE_PARTS_READ[2] = RE_HHMM_READ;
+  // Compose uses the plain source, which is exactly what version 0.1.2 ran. The read side adds the
+  // bare-hour branch on top of it.
   var RE_SRC = RE_PARTS.join("|");
-  var RE_SRC_BARE = RE_SRC + "|" + RE_BARE;
+  var RE_SRC_BARE = RE_PARTS_READ.join("|") + "|" + RE_BARE + "|" + RE_MIDDAY;
   // The same finders with the range branch removed. Used to re-read the span of a range that was
   // rejected ("step 2pm to 3pm", "10am and 2pm"), so every real time inside it is still found.
   var RE_NORANGE = RE_PARTS.slice(1).join("|");
-  var RE_NORANGE_BARE = RE_NORANGE + "|" + RE_BARE;
+  var RE_NORANGE_BARE = RE_PARTS_READ.slice(1).join("|") + "|" + RE_BARE + "|" + RE_MIDDAY;
 
   var DAYRE = "sunday|monday|tuesday|wednesday|thursday|friday|saturday|sun|mon|tues|tue|wed|thurs|thur|thu|fri|sat";
   var DAY_BEFORE = new RegExp("\\b(" + DAYRE + ")\\b\\.?,?[ \\u00a0]*(?:(?:at|@|from|by|around|on)\\b[ \\u00a0]*)?$", "i");
@@ -320,6 +349,10 @@
   function bareHour24(h) { return h >= 8 && h <= 11 ? h : (h % 12) + 12; }
   // A month name before the number ("Dec 5 CT", "Nov 5 or 6pm ET"): the number is a date.
   var MONTH_BEFORE = /(?:^|[^A-Za-z])(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\.?[ \u00a0]*$/i;
+  // A currency sign or code before the number, with spaces between them ("$ 5 PT", "USD 5 ET",
+  // "€ 3 CT"): an amount, never an hour. A sign glued to the number ("$5 PT") is already refused
+  // by the left-boundary guard LB.
+  var CURRENCY_BEFORE = /(?:[$\u00a3\u20ac\u00a5\u20b9\u00a2\u20a9\u20bd\u20aa\u0024]|(?:^|[^A-Za-z])(?:usd|eur|gbp|jpy|cad|aud|chf|cny|rmb|inr|mxn|brl|sek|nok|dkk|zar))[ \u00a0]+$/i;
   // A comma right before the number ("1,5 ET"): part of a longer number, not an hour.
   // The other characters in the never-list ($ . / : digits, word characters) are already refused
   // by the left-boundary guard LB.
@@ -338,13 +371,81 @@
   // means the number was counting something ("7 CT scans", "5 central themes").
   function clauseEnds(after) { return NAME_END.test(after); }
 
+  // A joiner glued to the clock that follows it ("4pm/5pm ET"): the left-boundary guard refuses
+  // that clock, so the main scan never reaches it. Group 1 is the joiner itself.
+  var HIDDEN_JOIN = new RegExp("^[ \\u00a0]*(\\/|&)(\\d{1,2}(?:[:.]\\d{2})?(?:[ \\u00a0]?(?:" + MER + "))?)", "i");
+
+  // One rule for every clock the sender wrote no zone word on, and for the other side of a joiner:
+  // step over any run of white space (spaces, tabs, line breaks), then
+  //   (a) a meridiem counts only as the very next token, with no bracket or quote between it and
+  //       the clock, so "4pm (am I right?)" keeps its assumed bar, and
+  //   (b) a zone word counts when it is the whole content of a bracket, brace or quote pair
+  //       ("(ET)", "[ Eastern ]", "(\nPT)"), or when it is the next bare token and passes the same
+  //       accepted-zone test the main zoneAfter uses: the abbreviation table, plus the spelled-name
+  //       rule (a clause end, punctuation, a "Time" tail, or a function word after it).
+  // Ordinary prose beside a clock is left alone, so "(a quick call)", "(am I right?)", "CT scans"
+  // and "ET units" never stand the assumed path down. A zone that does count is the writer's own,
+  // so the clock gets no bar: with a plain space the zoned branch reads the zone and converts the
+  // time, and across a line break nothing matches, which is right, because the add-in never
+  // guesses which clock a zone written on its own line belongs to (AGENTS.md).
+  // Read side only: compose never reaches the assumed path and never calls these.
+  var WS_RUN = /^\s*/;
+  var OPEN_CLOSE = { "(": ")", "[": "]", "{": "}", "<": ">", "\"": "\"", "'": "'", "\u201c": "\u201d", "\u2018": "\u2019" };
+  // A bracket pair's whole content as a zone: one word, with the optional "Standard/Daylight Time".
+  var BRACKET_ZONE = new RegExp("^([A-Za-z]+)(?:[ \\u00a0]*[+\\-\\u2212]\\d{1,2}(?::?\\d{2})?)?(?:[ \\u00a0]+(?:standard|daylight))?" +
+    "(?:[ \\u00a0]+time(?:[ \\u00a0]+zone)?)?$", "i");
+  // The same test zoneAfter runs on a written word: the table, in the case the table accepts.
+  // An ambiguous abbreviation counts here too: the writer wrote a zone either way.
+  function isZoneTok(tok) { return zoneWord(tok) !== null; }
+  // (b), for the text that follows a clock: the length of the white space and zone word consumed,
+  // or -1 when the text beside the clock is not a zone word.
+  function zoneSpanAfter(after) {
+    var sp = ZONE_SEP_PUNCT.exec(after);
+    var ws = sp ? sp[0].length : WS_RUN.exec(after)[0].length, rest = after.slice(ws);
+    var close = OPEN_CLOSE[rest.charAt(0)];
+    if (close) {
+      var end = rest.indexOf(close, 1);
+      if (end < 0) return -1;
+      var bm = BRACKET_ZONE.exec(rest.slice(1, end).replace(/^\s+|\s+$/g, ""));
+      return bm && isZoneTok(bm[1]) ? ws + end + 1 : -1;
+    }
+    var m = /^[A-Za-z]+/.exec(rest);
+    if (!m || !isZoneTok(m[0]) || !nameAccepted(m[0], rest.slice(m[0].length))) return -1;
+    return ws + m[0].length;
+  }
+  function zoneFollows(after) { return zoneSpanAfter(after) >= 0; }
+  // (a). The single-letter meridiems are a meridiem only glued to the clock ("4a", "9p"): a lone
+  // "a" or "p" standing as its own word is ordinary prose ("4pm (a quick call)").
+  var MER_NEXT = new RegExp("^(?:" + MER + ")" + MER_END, "i");
+  function merFollows(after) {
+    if (/^[ap](?![A-Za-z])/i.test(after)) return true;
+    return MER_NEXT.test(after.slice(WS_RUN.exec(after)[0].length));
+  }
+  // Read-side text, prepared for the one white space class the time forms use: the no-break space,
+  // the narrow no-break space and the thin space are the plain space a mail client replaced, so
+  // they are mapped back, and a run of plain spaces counts as one gap. Tabs and line breaks are
+  // left exactly as written: they are hard separators, so a time never joins its meridiem or its
+  // zone word across one. The returned text is the same length in characters as the text given
+  // only when no run was collapsed, so this runs before parsing and nothing maps offsets back.
+  function normalizeRead(text) {
+    return String(text == null ? "" : text)
+      .replace(/[\u00a0\u202f\u2009]/g, " ")
+      .replace(/ {2,}/g, " ");
+  }
+
   // Returns matches: {s, e, text, h1, mi1, h2, mi2, zoneTok, hasZone, dayIdx}
   // Times with an invalid shape are consumed and dropped, never half-converted.
   // refMs: the message or draft date, used to tell whether a "4pm ET / 1pm PT" pair is one instant.
   // bare: read the bare-hour forms too ("2 pacific", "4 or 5pm cst"). Read side only; compose
   // leaves it off, so its output is exactly what version 0.1.2 gave (AGENTS.md).
   function findTimes(text, refMs, bare) {
-    var re = new RegExp(bare ? RE_SRC_BARE : RE_SRC, "gid"), out = [], m;
+    var re = new RegExp(bare ? RE_SRC_BARE : RE_SRC, "gid"), out = [], ghosts = [], m;
+    // Read side: where each time with a written zone starts, whether or not the add-in reads that
+    // zone (a refused IST, a zone in brackets or quotes). The assumed path stands down in any
+    // sentence that holds one (readerBar). zoneEnd: end of the last zone word read, so the scan
+    // resumes after it and never reads digits inside an offset ("UTC\u221207:00") as a time.
+    var zoned = [], zoneEnd = 0;
+    out.zoned = zoned;
     var refForPair = refMs || Date.now();
     while ((m = re.exec(text))) {
       var g0 = m.groups, ms = m.index, me = ms + m[0].length;
@@ -362,28 +463,42 @@
           var cut = m.indices.groups.rh2[0];
           var sub = new RegExp(bare ? RE_NORANGE_BARE : RE_NORANGE, "gi"), sm;
           sub.lastIndex = ms;
-          while ((sm = sub.exec(text)) && sm.index < cut) handle(sm);
+          while ((sm = sub.exec(text)) && sm.index < cut) {
+          handle(sm);
+          if (bare && zoneEnd > sub.lastIndex) sub.lastIndex = zoneEnd;
+        }
           re.lastIndex = cut;
           continue;
         }
       }
       handle(m);
+      if (bare && zoneEnd > re.lastIndex) re.lastIndex = zoneEnd;
     }
     function handle(m) {
+      zoneEnd = 0;
       var g = m.groups, r = { s: m.index, e: m.index + m[0].length, text: m[0], h2: null, mi2: null };
       var before = text.slice(Math.max(0, r.s - 30), r.s);
       var afterRaw = text.slice(r.e, r.e + 60);
-      var z = zoneAfter(afterRaw);
+      var z = zoneAfter(afterRaw, bare);
       // A bare hour is a time only with an accepted zone word right after it, or when it is joined
       // to a following time that carries both a meridiem and a zone word. Everything else
       // ("3 a day", "2 people", "version 2") is an ordinary number and is left alone.
       var join = null, joinHidden = false, prevMer = null, bareOwnZone = false;
       if (g.bh !== undefined) {
-        if (z === SKIP) return;
+        if (z === SKIP) {
+          // A bare hour whose zone word the add-in refused to read is still a clock the writer
+          // wrote a zone on, so it is a zoned neighbor for the joiner rule ("7 IST and/or 4pm").
+          if (bare) {
+            var bgs = zoneSpanAfter(afterRaw);
+            if (bgs >= 0) { ghosts.push({ s: r.s, e: r.e + bgs, hasZone: true }); zoned.push(r.s); }
+          }
+          return;
+        }
         // Never when the number counts something else, follows a month name, or follows a comma.
         // The other characters in the never-list (a slash, a period, a currency sign, another
         // digit) are already refused by the left-boundary guard LB.
-        if (RANGE_UNIT_BEFORE.test(before) || MONTH_BEFORE.test(before) || COMMA_BEFORE.test(before)) return;
+        if (RANGE_UNIT_BEFORE.test(before) || MONTH_BEFORE.test(before) || COMMA_BEFORE.test(before) ||
+          CURRENCY_BEFORE.test(before)) return;
         if (z) {
           // The zone word has to sit right after the hour with nothing but spaces between them,
           // and it has to close the clause: end, punctuation, or a function word. An abbreviation
@@ -399,8 +514,37 @@
           joinHidden = JOIN_BLOCKED.test(join[0].charAt(join.indices[1][0] - 1));
         }
       }
-      if (z === SKIP || (!z && !join && g.sh === undefined && g.rh1 === undefined)) return;
-      if (z) { r.e += z.len; r.text = text.slice(r.s, r.e); }
+      // A recognized clock time with no zone written is kept on the read side, where it is
+      // converted from the sender's mail clock and marked "assumed" (AGENTS.md). Compose never
+      // sees these forms without a zone, so its output is exactly what version 0.1.2 gave: the
+      // 24-hour, military and noon branches still require a zone word when bare is off.
+      var assumedOnly = !z && !join && g.sh === undefined && g.rh1 === undefined && g.bh === undefined;
+      if (z === SKIP) {
+        // A clock whose own zone word the add-in refused to read (an ambiguous abbreviation, an
+        // offset it cannot take) is still a clock the writer wrote a zone on. It leaves no match,
+        // so the joiner rule below would never see it. Remember its span, zone word included, as a
+        // zoned neighbor ("4pm IST / 1pm").
+        if (bare) {
+          var gs = zoneSpanAfter(afterRaw);
+          if (gs >= 0) { ghosts.push({ s: r.s, e: r.e + gs, hasZone: true }); zoned.push(r.s); }
+        }
+        return;
+      }
+      if (z) zoned.push(r.s);
+      if (assumedOnly && !bare) return;
+      // Read side, one rule for every time the sender wrote no zone word on: a meridiem as the very
+      // next token, or an accepted zone word beside it, belongs to that time, so the time gets no
+      // bar rather than one read on the sender's mail clock ("4 pm\nET", "09:00 (\nET)"). With a
+      // plain space the zoned branch reads the zone itself. Ordinary prose in brackets beside the
+      // clock ("4pm (am I right?)") is not a zone, so that clock keeps its assumed bar.
+      if (bare && !z && !join && (merFollows(afterRaw) || zoneFollows(afterRaw))) {
+        if (zoneFollows(afterRaw)) zoned.push(r.s);
+        return;
+      }
+      // Only a time with am or pm written is ever assumed (AGENTS.md, narrow assumed path). A
+      // noon, midnight, midday, 24-hour or NNNN hrs clock with no zone gets no bar.
+      if (assumedOnly) return;
+      if (z) { r.e += z.len; r.text = text.slice(r.s, r.e); zoneEnd = r.e; }
       var after = text.slice(r.e, r.e + 40);
       // The word the time sits in, for the glued-token guard below. A slash ends the word the same
       // way a space does, so an offset on the time before it ("4pm UTC+1/noon PT") never reaches
@@ -441,7 +585,7 @@
           // on the following time there is nothing to borrow, so the bare hour is not a time.
           var jm = +join[1], jmi = join[2] ? +join[2] : 0;
           if (jm < 1 || jm > 12 || jmi > 59) return;
-          var jz = zoneAfter(text.slice(r.e + join[0].length, r.e + join[0].length + 60));
+          var jz = zoneAfter(text.slice(r.e + join[0].length, r.e + join[0].length + 60), bare);
           if (!jz || jz === SKIP) return;
           var jc = join[3].toLowerCase()[0], j24 = to24(jm, jc);
           // The meridiem is the one that puts the bare hour at or before the following time, so
@@ -458,8 +602,10 @@
           r.h1 = bareHour24(bh); r.mi1 = 0;
         }
       } else {
-        r.h1 = g.nm.toLowerCase() === "noon" ? 12 : 0; r.mi1 = 0;
-        r.word = g.nm; // "noon"/"midnight": shown as written, capitalized
+        var nword = g.nm !== undefined ? g.nm : g.md;
+        // "midday" is noon, shown as the sender wrote it.
+        r.h1 = nword.toLowerCase() === "midnight" ? 0 : 12; r.mi1 = 0;
+        r.word = nword; // "noon"/"midnight"/"midday": shown as written, capitalized
       }
       r.hasZone = !!z;
       // Which bare-hour rule read this one, for the read side and for a differential run:
@@ -468,6 +614,19 @@
       if (z) { r.zoneTok = z.tok; r.zoneRaw = z.raw; r.zoneRegion = z.region; }
       r.dayIdx = dayWord(text, r.s, r.e);
       out.push(r);
+      // A joiner glued to the number after it ("4pm/5pm ET") blocks that number's left boundary, so
+      // the following time is never a match of its own and the joiner rule below would not see it.
+      // Remember its span, zone word included, as a zoned neighbor.
+      if (bare && !r.hasZone) {
+        var hj = HIDDEN_JOIN.exec(text.slice(r.e, r.e + 60));
+        if (hj) {
+          var hs = zoneSpanAfter(text.slice(r.e + hj[0].length, r.e + hj[0].length + 60));
+          if (hs >= 0) {
+            ghosts.push({ s: r.e + hj[0].length - hj[2].length, e: r.e + hj[0].length + hs, hasZone: true });
+            zoned.push(r.e + hj[0].length - hj[2].length);
+          }
+        }
+      }
       // A joiner glued to the number after it ("4/5pm ET") blocks that number's left boundary, so
       // the joined time is read here. With any other joiner the main scan reaches it itself.
       if (join && joinHidden) {
@@ -506,13 +665,57 @@
     // ("4pm IST / 1pm"), and the add-in's own bracket between them is stepped over so a second
     // click sees the same thing as the first.
     // The rule is symmetric: the zoned time may sit on either side of the joiner.
-    for (var j = 0; j < out.length; j++) {
-      if (out[j].hasZone) continue;
-      if (leftIsZonedTime(text.slice(0, out[j].s)) ||
-        rightIsZonedTime(text.slice(out[j].e, out[j].e + 80))) out[j].nextToZoned = true;
+    //
+    // Read side: adjacency is decided from this scan's own match list, never from a second set of
+    // zone regexes. For each no-zone match the neighboring match on each side is looked at: when
+    // the text between them is only a joiner and that neighbor carries a zone (whatever separator
+    // or range form the scan accepted: "5pm-ET", "5pm, ET", "5pm to 6pm ET"), the no-zone match
+    // gets no bar. Compose keeps the version 0.1.2 text rules below.
+    if (bare) {
+      // A bracket group this add-in wrote holds times it already showed, so those matches are not
+      // the writer's own neighbors: the clock before the bracket is ("4pm ET [3pm CT / 4pm ET] or 5pm").
+      var mine = ownSpans(text);
+      // A bracket that follows a joiner is the writer's own ("4pm or [5pm ET]"): this add-in only
+      // writes its bracket after a time, so such a group still counts as a zoned neighbor.
+      mine = mine.filter(function (sp) { return !JOIN_LEFT.test(text.slice(0, sp[0])); });
+      var all = out.concat(ghosts).filter(function (a) { return !inOwnBracket(mine, a.s); })
+        .sort(function (a, b) { return a.s - b.s || a.e - b.e; });
+      for (var k = 0; k < all.length; k++) {
+        if (all[k].hasZone) continue;
+        var prev = k > 0 ? all[k - 1] : null, next = all[k + 1] || null;
+        if ((prev && prev.hasZone && onlyJoiner(text.slice(prev.e, all[k].s))) ||
+          (next && next.hasZone && onlyJoiner(text.slice(all[k].e, next.s)))) all[k].nextToZoned = true;
+      }
+    } else {
+      for (var j = 0; j < out.length; j++) {
+        if (out[j].hasZone) continue;
+        if (leftIsZonedTime(text.slice(0, out[j].s)) ||
+          rightIsZonedTime(text.slice(out[j].e, out[j].e + 80))) out[j].nextToZoned = true;
+      }
+    }
+    // A zone written out as a phrase of capitalized words ending in Time ("Central European Time",
+    // "India Standard Time"), quoted or not, is a written zone for the sentence rule even when the
+    // add-in does not convert it.
+    if (bare) {
+      var tp = /(?<![A-Za-z])(?:[A-Z][A-Za-z]*[ \u00a0]+)+Time\b/g, tm;
+      while ((tm = tp.exec(text))) zoned.push(tm.index);
     }
     return out;
   }
+
+  // The text between two neighboring matches is only a joiner: a choice word (or, and, &, and/or),
+  // a slash, or a dash, with spaces around it, plus at most one filler word ("or at 5pm", "and
+  // maybe 5pm", "/ between 2 and 3pm") and the add-in's own bracket, which is stepped over so a
+  // second click sees the same thing as the first. Any other text (a comma, a semicolon, "then",
+  // ordinary prose) is not a joiner, so the two clocks are separate times.
+  var OWN_BRACKET = "\\[\\s*" + ITEM + "(?:\\s*\\/\\s*" + ITEM + ")*\\s*\\]";
+  // An opening or closing bracket, paren or quote may sit around either side of the joiner
+  // ("4pm or (5pm ET)", "(4pm) or 5pm ET", "4pm or [5pm ET]").
+  var WRAP = "[ \\u00a0()\\[\\]{}<>\"'\\u201c\\u201d\\u2018\\u2019]*";
+  var ONLY_JOINER = new RegExp("^" + WRAP + "(?:" + OWN_BRACKET + WRAP + ")?" +
+    "(?:and\\/or|or|and|&|\\/|-|\\u2013|\\u2014|\\u2212)" +
+    WRAP + "(?:" + OWN_BRACKET + WRAP + ")?(?:(?:at|maybe|either|between)[ \\u00a0]+)?$", "i");
+  function onlyJoiner(between) { return ONLY_JOINER.test(between); }
 
   // The left text ends with "<time><zone word> [own bracket] <joiner>": a zoned time joined to the
   // bare time that follows. The joiner is a slash or a choice word (or, and, &, and/or), with at
@@ -523,9 +726,15 @@
   // opens a bare range ("4pm ET / between 2 and 3pm").
   var FILLER_LEFT = /(?:^|[ \u00a0])(?:at|maybe|either|between)[ \u00a0]*$/i;
   var JOIN_LEFT = /(?:\band\/or|\bor|\band|&|\/)[ \u00a0]*$/i;
-  var LEFT_ZONE = new RegExp("(?:\\d|noon|midnight)[^\\/\\[\\]]{0,45}?(" + ZONE_KEYS + "|" + AMBIGUOUS.join("|") + ")" +
-    "(?:[ \\u00a0]+(?:standard|daylight))?(?:[ \\u00a0]+time(?:[ \\u00a0]+zone)?)?" +
-    "(?:[+\\-\\u2212]\\d{1,2}(?::?\\d{2})?)?[)\\]]?[ \\u00a0]*$", "i");
+  // The time on either side of the joiner. Compose runs exactly the version 0.1.2 source: a clock
+  // (a digit) or the words noon and midnight.
+  var TIME_WORD = "noon|midnight";
+  function leftZoneRe(word, open, close, bound) {
+    return new RegExp("(?:\\d|" + word + ")[^\\/\\[\\]]{0,45}?" + open + bound + "(" + ZONE_KEYS + "|" + AMBIGUOUS.join("|") + ")" +
+      "(?:[ \\u00a0]+(?:standard|daylight))?(?:[ \\u00a0]+time(?:[ \\u00a0]+zone)?)?" +
+      "(?:[+\\-\\u2212]\\d{1,2}(?::?\\d{2})?)?" + close + "$", "i");
+  }
+  var LEFT_ZONE = leftZoneRe(TIME_WORD, "", "[)\\]]?[ \\u00a0]*", "");
   function leftIsZonedTime(left) {
     var s = left.replace(/[ \u00a0]*$/, "").replace(FILLER_LEFT, "").replace(/[ \u00a0]*$/, "");
     var j = JOIN_LEFT.exec(s);
@@ -544,8 +753,11 @@
   var OWN_RIGHT = new RegExp("^[ \\u00a0]*\\[\\s*" + ITEM + "(?:\\s*\\/\\s*" + ITEM + ")*\\s*\\]", "i");
   var JOIN_RIGHT = /^(?:and\/or|or|and|&|\/)(?![A-Za-z\/])/i;
   var FILLER_RIGHT = /^[ \u00a0]*(?:at|maybe|either)(?![A-Za-z])/i;
-  var RIGHT_ZONE = new RegExp("^[ \\u00a0]*(?:between[ \\u00a0]+)?[(\\[]?(?:\\d|noon|midnight)" +
-    "[^\\/\\[\\]]{0,45}?[ \\u00a0(]?(" + ZONE_KEYS + "|" + AMBIGUOUS.join("|") + ")(?![A-Za-z])", "i");
+  function rightZoneRe(word, gap, bound) {
+    return new RegExp("^[ \\u00a0]*(?:between[ \\u00a0]+)?[(\\[]?(?:\\d|" + word + ")" +
+      "[^\\/\\[\\]]{0,45}?" + gap + bound + "(" + ZONE_KEYS + "|" + AMBIGUOUS.join("|") + ")(?![A-Za-z])", "i");
+  }
+  var RIGHT_ZONE = rightZoneRe(TIME_WORD, "[ \\u00a0(]?", "");
   function rightIsZonedTime(right) {
     var s = right.replace(OWN_RIGHT, "").replace(/^[ \u00a0]*/, "");
     var j = JOIN_RIGHT.exec(s);
@@ -818,10 +1030,39 @@
     for (var k in m) if (Object.prototype.hasOwnProperty.call(m, k)) copy[k] = m[k];
     copy.zoneRegion = src;
     copy.hasZone = true;
-    copy.capOverride = m.word ? m.word.toLowerCase()
-      : fmt(m.h1, m.mi1) + (m.h2 !== null ? "-" + fmt(m.h2, m.mi2) : "");
+    copy.capOverride = fmt(m.h1, m.mi1) + (m.h2 !== null ? "-" + fmt(m.h2, m.mi2) : "");
     copy.zoneOverride = "assumed " + offsetLabel(offMin);
     return copy;
+  }
+
+  // Sentences, for the narrow assumed path (AGENTS.md). A sentence ends after ? or ! (with any
+  // closing quote or bracket) whatever follows, after a . that is followed by white space and then
+  // a capital letter, a digit or the end of the text, and at a blank line. A dot before a lowercase
+  // word never ends one ("the U.S. team", "approx. 4pm"). Where a capital follows, a dot after a
+  // title, abbreviation, "a.m."/"p.m." or a single capital letter ("Dr. Smith", "J. Smith") still
+  // does not. Returns the end index of each sentence, in order.
+  var SENT_END = /[.?!]+[)\]"'\u201d\u2019]*(?=\s|$)|\r?\n(?=[ \t]*\r?\n)/g;
+  var ABBREV = /(?:^|[^A-Za-z.])(?:dr|mr|mrs|ms|st|jr|sr|vs|etc|e\.g|i\.e|a\.m|p\.m|inc|ltd|no)$/i;
+  var INITIAL = /(?:^|[^A-Za-z.])[A-Z]$/;
+  function sentenceEnds(text) {
+    var ends = [], m;
+    SENT_END.lastIndex = 0;
+    while ((m = SENT_END.exec(text))) {
+      if (/^[.]+[)\]"'\u201d\u2019]*$/.test(m[0])) {
+        var rest = text.slice(m.index + m[0].length);
+        if (!/^\s*$|^\s+[A-Z0-9]/.test(rest)) continue;
+        if (/^\s+[A-Z]/.test(rest) && m[0] === "." &&
+          (ABBREV.test(text.slice(Math.max(0, m.index - 12), m.index)) ||
+            INITIAL.test(text.slice(Math.max(0, m.index - 2), m.index)))) continue;
+      }
+      ends.push(m.index + m[0].length);
+    }
+    return ends;
+  }
+  function sentenceOf(ends, pos) {
+    var n = 0;
+    while (n < ends.length && ends[n] <= pos) n++;
+    return n;
   }
 
   // o: {displayName, refMs, deviceTz, others, senderOffsetMin}. Returns an array of bar strings
@@ -831,11 +1072,16 @@
   // written is converted from that offset and marked "assumed". Missing, unreadable, or +0000
   // (which is 0 and so falsy here): that time gets no bar.
   function readerBar(text, o) {
-    var items = [], seen = {}, body = stripQuoted(text);
+    var items = [], seen = {}, body = normalizeRead(stripQuoted(text));
     if (!validZone(o.deviceTz)) return null;
     var own = ownSpans(body);
     var assumedZone = offsetZoneFromMin(o.senderOffsetMin);
-    findTimes(body, o.refMs, true).forEach(function (m) {
+    var found = findTimes(body, o.refMs, true);
+    // The narrow assumed path: a sentence with a time that has a written zone (read or refused)
+    // most likely means that zone for every time in it, so no time there is read on the mail clock.
+    var ends = sentenceEnds(body), zonedSentence = {};
+    found.zoned.forEach(function (p) { zonedSentence[sentenceOf(ends, p)] = true; });
+    found.forEach(function (m) {
       // A bracket group this add-in wrote holds a time already shown by the time before it. Any
       // other bracket ("see [notes: 4pm ET]") is ordinary prose and is read normally.
       if (inOwnBracket(own, m.s)) return;
@@ -847,7 +1093,7 @@
       } else {
         // No zone written. A bare time joined to a zoned one is the writer's own pair and is left
         // alone (AGENTS.md joiner rule). Otherwise it is read on the sender's mail clock.
-        if (m.nextToZoned || !assumedZone) return;
+        if (m.nextToZoned || !assumedZone || zonedSentence[sentenceOf(ends, m.s)]) return;
         src = assumedZone;
         assumed = true;
       }
