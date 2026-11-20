@@ -94,6 +94,55 @@
     });
   }
 
+  // Outlook's Text coercion glues HTML block elements together with no separator ("tuesdayOn Fri,
+  // Nov 13..."), which hides weekdays and line starts from the parser. So an HTML body is read as
+  // HTML and turned into text here: a line break before and after every block element. DOMParser
+  // builds a detached document, so nothing from the mail is ever inserted into the live pane.
+  var BLOCKS = {};
+  ("DIV P BR LI TR TABLE H1 H2 H3 H4 H5 H6 BLOCKQUOTE HR SECTION ARTICLE HEADER FOOTER PRE")
+    .split(" ").forEach(function (t) { BLOCKS[t] = true; });
+  var SKIPPED = { SCRIPT: true, STYLE: true, HEAD: true };
+
+  function htmlToText(html) {
+    var doc = new DOMParser().parseFromString(String(html), "text/html");
+    var out = [];
+    function walk(node) {
+      if (node.nodeType === 3) { out.push(node.nodeValue); return; }
+      if (node.nodeType !== 1) return;
+      var tag = node.nodeName.toUpperCase();
+      if (SKIPPED[tag]) return;
+      if (BLOCKS[tag]) out.push("\n");
+      for (var c = node.firstChild; c; c = c.nextSibling) walk(c);
+      if (BLOCKS[tag]) out.push("\n");
+    }
+    walk(doc.body || doc.documentElement);
+    return out.join("").replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n");
+  }
+
+  // The body as text: HTML mail through htmlToText, plain-text mail (or any HTML read that fails)
+  // as the Text coercion. cb gets an AsyncResult-shaped { status, value } exactly once.
+  function readBody(item, cb) {
+    var sent = false;
+    function reply(r) { if (!sent) { sent = true; cb(r); } }
+    function asText() {
+      try { item.body.getAsync(Office.CoercionType.Text, reply); } catch (e) { reply(null); }
+    }
+    if (typeof item.body.getTypeAsync !== "function") return asText();
+    try {
+      item.body.getTypeAsync(function (t) {
+        if (!t || t.status !== Office.AsyncResultStatus.Succeeded || t.value !== Office.CoercionType.Html) return asText();
+        try {
+          item.body.getAsync(Office.CoercionType.Html, function (r) {
+            if (!r || r.status !== Office.AsyncResultStatus.Succeeded) return asText();
+            try {
+              reply({ status: r.status, value: htmlToText(r.value) });
+            } catch (e) { asText(); }
+          });
+        } catch (e) { asText(); }
+      });
+    } catch (e) { asText(); }
+  }
+
   // The body read waits at most this long. A host that accepts getAsync but never answers must
   // still leave the message painted, with its bars cleared (AGENTS.md: the pane is never blank).
   // It covers the body read only: once the body arrives this timer is cleared and the header wait
@@ -124,7 +173,7 @@
     }
     var bodyTimer = setTimeout(function () { finish([]); }, BODY_WAIT);
     try {
-      item.body.getAsync(Office.CoercionType.Text, function (r) {
+      readBody(item, function (r) {
         // The body is here, so its wait is over: a body that arrived after the wait still gets its
         // bars, replacing the empty state the wait painted.
         clearTimeout(bodyTimer);

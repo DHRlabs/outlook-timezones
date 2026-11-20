@@ -329,9 +329,13 @@
   // Short forms that are also words (sat, sun, mon, wed) count only when capitalized.
   // Full names (thursday, monday) count in any case: no English word collides with them.
   function isDay(m) { return m && !(/^(sat|sun|mon|wed)$/.test(m[1])); }
-  function dayWord(text, s, e) {
-    var m = DAY_BEFORE.exec(text.slice(Math.max(0, s - 30), s));
-    if (!isDay(m)) m = DAY_AFTER.exec(text.slice(e, e + 30));
+  // bare (read side): a single line break between words counts as a space, so a line Office
+  // wrapped ("2 pacific on" / "tuesday") still carries its day. Compose reads its text as before.
+  var LONE_BREAK = /([^\r\n])[ \t]*\r?\n[ \t]*(?=[^\r\n])/g;
+  function dayWord(text, s, e, bare) {
+    var gap = function (t) { return bare ? t.replace(LONE_BREAK, "$1 ") : t; };
+    var m = DAY_BEFORE.exec(gap(text.slice(Math.max(0, s - 30), s)));
+    if (!isDay(m)) m = DAY_AFTER.exec(gap(text.slice(e, e + 30)));
     return isDay(m) ? DAYIDX[m[1].slice(0, 3).toLowerCase()] : null;
   }
 
@@ -612,7 +616,7 @@
       // "zone" is a bare hour on its own zone word, "join" one joined to a zoned time.
       if (g.bh !== undefined) r.bareRule = join ? "join" : "zone";
       if (z) { r.zoneTok = z.tok; r.zoneRaw = z.raw; r.zoneRegion = z.region; }
-      r.dayIdx = dayWord(text, r.s, r.e);
+      r.dayIdx = dayWord(text, r.s, r.e, bare);
       out.push(r);
       // A joiner glued to the number after it ("4pm/5pm ET") blocks that number's left boundary, so
       // the following time is never a match of its own and the joiner rule below would not see it.
@@ -1010,9 +1014,18 @@
     return bar + (extraZones ? " | +" + extraZones + " more zones" : "");
   }
 
+  // Where a quoted thread starts in the middle of a line, which is how Office hands over the text
+  // of an HTML mail (the blockquote has no ">" and the header may share a line with the reply):
+  // "On <weekday, month or date ...> wrote:" (the nearest "On" before "wrote:"), an Original Message
+  // rule, and a "From: ... Sent: ..." block. Everything from the match on is the earlier message.
+  var INLINE_QUOTE = new RegExp(
+    "\\bOn\\s+(?=(?:" + DAYRE + "|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\\d+)[a-z]*[\\s.,\\/-])" +
+    "(?:(?!\\bOn\\s)[^\\r\\n]){5,200}?\\swrote:[\\s\\S]*" +
+    "|-{2,}[ \\t]*original message[\\s\\S]*" +
+    "|\\bFrom:[ \\t][^\\r\\n]{1,200}?[ \\t]Sent:[ \\t][\\s\\S]*", "i");
   // Cut the quoted thread and signature-style tails so old messages' times are ignored.
   function stripQuoted(text) {
-    var lines = String(text || "").split(/\r?\n/), out = [];
+    var lines = String(text || "").replace(INLINE_QUOTE, "").split(/\r?\n/), out = [];
     for (var i = 0; i < lines.length; i++) {
       var l = lines[i];
       if (/^\s*(-{2,}\s*original message|(from|de|von|da)\s?:\s|on .{5,200}wrote:|_{10,}|sent from my |get outlook for )/i.test(l)) break;
