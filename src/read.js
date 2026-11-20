@@ -127,17 +127,14 @@
     function asText() {
       try { item.body.getAsync(Office.CoercionType.Text, reply); } catch (e) { reply(null); }
     }
-    if (typeof item.body.getTypeAsync !== "function") return asText();
+    // Read mode has no getTypeAsync (it is compose-only), so always ask for HTML first: Outlook
+    // returns HTML for plain-text mail too. The Text form glues paragraphs together
+    // ("tuesdayOn Fri"), which hides weekdays and reply headers; it is only the fallback.
     try {
-      item.body.getTypeAsync(function (t) {
-        if (!t || t.status !== Office.AsyncResultStatus.Succeeded || t.value !== Office.CoercionType.Html) return asText();
+      item.body.getAsync(Office.CoercionType.Html, function (r) {
+        if (!r || r.status !== Office.AsyncResultStatus.Succeeded || typeof r.value !== "string") return asText();
         try {
-          item.body.getAsync(Office.CoercionType.Html, function (r) {
-            if (!r || r.status !== Office.AsyncResultStatus.Succeeded) return asText();
-            try {
-              reply({ status: r.status, value: htmlToText(r.value) });
-            } catch (e) { asText(); }
-          });
+          reply({ status: r.status, value: htmlToText(r.value) });
         } catch (e) { asText(); }
       });
     } catch (e) { asText(); }
